@@ -20,9 +20,9 @@ The core component of OSM is the **`OperatorBlock`**.
 
 Rather than representing sequence aggregation as attention between token pairs, each token emits an affine operator consisting of:
 
-\[
+$$
 a_t = \rho_t e^{i\phi_t}
-\]
+$$
 
 where:
 
@@ -31,23 +31,23 @@ where:
 
 and:
 
-\[
+$$
 b_t \in \mathbb{C}^{d}
-\]
+$$
 
 is the complex-valued information injected at timestep \(t\).
 
 The hidden-state recurrence is:
 
-\[
+$$
 z_t = a_t z_{t-1} + b_t
-\]
+$$
 
 with:
 
-\[
+$$
 z_t \in \mathbb{C}^{d}
-\]
+$$
 
 ---
 
@@ -55,17 +55,17 @@ z_t \in \mathbb{C}^{d}
 
 Each timestep can be interpreted as an affine transformation:
 
-\[
+$$
 f_t(z) = a_t z + b_t
-\]
+$$
 
 Two affine operators compose as:
 
-\[
+$$
 (a_2, b_2) \circ (a_1, b_1)
 =
 (a_2 a_1,\; a_2 b_1 + b_2)
-\]
+$$
 
 This composition is **associative**, which means the sequential recurrence can be evaluated with a parallel prefix-scan algorithm instead of strictly from left to right.
 
@@ -106,9 +106,9 @@ OSM represents its recurrent state in the complex domain.
 
 The multiplicative operator
 
-\[
+$$
 a_t = \rho_t e^{i\phi_t}
-\]
+$$
 
 contains both:
 
@@ -123,9 +123,9 @@ This gives the recurrence a natural mechanism for representing periodic, oscilla
 
 The retention parameter is initialized using a positive bias:
 
-\[
+$$
 \rho = \sigma(4.5) \approx 0.989
-\]
+$$
 
 so the model begins training as a near-perfect accumulator.
 
@@ -143,17 +143,17 @@ This initialization is intended to support:
 
 Standard dense self-attention requires pairwise token interactions and scales quadratically with sequence length:
 
-\[
+$$
 O(T^2)
-\]
+$$
 
 OSM instead evaluates the recurrence through an associative Hillis–Steele scan.
 
 The scan uses logarithmic parallel depth and \(O(T \log T)\) total scan work:
 
-\[
+$$
 O(T \log T)
-\]
+$$
 
 while preserving the underlying recurrent formulation.
 
@@ -165,15 +165,15 @@ During autoregressive generation, there is no need to recompute the full scan.
 
 Only the current recurrent state must be retained:
 
-\[
+$$
 z_t = a_t z_{t-1} + b_t
-\]
+$$
 
 Therefore inference requires a fixed-size recurrent state independent of sequence length:
 
-\[
+$$
 O(1)
-\]
+$$
 
 with respect to the number of previously processed tokens.
 
@@ -227,9 +227,9 @@ A real-valued scalar recurrence can primarily express attenuation or amplificati
 
 A complex-valued multiplier adds another degree of freedom:
 
-\[
+$$
 a = \rho e^{i\phi}
-\]
+$$
 
 Multiplying by \(a\) performs both:
 
@@ -238,9 +238,9 @@ Multiplying by \(a\) performs both:
 
 Repeated application produces:
 
-\[
+$$
 a^k = \rho^k e^{ik\phi}
-\]
+$$
 
 which naturally combines exponentially decaying memory with oscillatory structure.
 
