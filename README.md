@@ -1,352 +1,281 @@
+<div align="center">
+
 # OSM: Operator Scan Model
+### Sub-Quadratic Sequence Modeling via Complex Associative Affine Scans
 
-**Operator Scan Model (OSM)** is a highly efficient, sub-quadratic sequence modeling architecture based on **complex-valued associative affine scans**.
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![PyTorch 2.0+](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Status: Experimental](https://img.shields.io/badge/Status-Research%20Preview-purple.svg)]()
 
-Instead of standard attention, OSM uses a parallelizable **Hillis–Steele prefix scan** over complex diagonal affine operators. This gives the model:
+**Author:** [Krzysztof Strehlau](https://github.com/cziter15) &bull; **Year:** 2026
 
-- **\(O(T \log T)\)** parallel training work
-- **\(O(1)\)** recurrent state size during autoregressive inference
-- Transformer-style residual blocks without quadratic self-attention
-- Complex-valued dynamics that combine decay and phase rotation
-
-> **Author:** Krzysztof Strehlau (2026)  
-> **Repository:** [github.com/cziter15](https://github.com/cziter15)
+</div>
 
 ---
 
-## Architecture Overview
+## ⚡ TL;DR
 
-The core component of OSM is the **`OperatorBlock`**.
+**Operator Scan Model (OSM)** is a linear-time sequence architecture designed to eliminate the quadratic bottleneck of self-attention without sacrificing expressiveness or parallel training efficiency. 
 
-Rather than representing sequence aggregation as attention between token pairs, each token emits an affine operator consisting of:
+OSM replaces pairwise attention matrices with a **complex-valued diagonal affine recurrence** computed in parallel using an **associative Hillis–Steele prefix scan**:
 
-$$
-a_t = \rho_t e^{i\phi_t}
-$$
+$$\Large z_t = a_t \odot z_{t-1} + b_t, \quad a_t = \rho_t e^{i\phi_t}, \quad z_t, b_t \in \mathbb{C}^d$$
 
-where:
-
-- \(\rho_t \in (0,1)\) is the retention / decay rate
-- \(\phi_t\) is the phase rotation
-
-and:
-
-$$
-b_t \in \mathbb{C}^{d}
-$$
-
-is the complex-valued information injected at timestep \(t\).
-
-The hidden-state recurrence is:
-
-$$
-z_t = a_t z_{t-1} + b_t
-$$
-
-with:
-
-$$
-z_t \in \mathbb{C}^{d}
-$$
+* 🚀 **$O(T \log T)$ parallel training work** with $O(\log T)$ scan depth.
+* ⚡ **$O(1)$ constant memory & latency** per generated token during inference (no growing KV cache).
+* 🌊 **Complex polar dynamics** ($\rho$ magnitude decay + $\phi$ phase rotation) naturally handle positional encoding, periodicity, and decay.
 
 ---
 
-## Associative Affine Composition
+## 📊 Comparison at a Glance
 
-Each timestep can be interpreted as an affine transformation:
+| Architecture | Training Work | Parallel Depth | Inference State | KV Cache Growth | Explicit Positional Encoding |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Standard Transformer** | $O(T^2)$ | $O(1)$ | $O(T)$ | **Linear $O(T)$** | Required (RoPE / ALiBi) |
+| **Vanilla RNN / LSTM** | $O(T)$ | $O(T)$ | $O(1)$ | **None $O(1)$** | Implicit (Sequential) |
+| **Mamba / S4 (SSMs)** | $O(T)$ | $O(\log T)$ | $O(1)$ | **None $O(1)$** | Implicit / Continuous |
+| **OSM (Ours)** | **$O(T \log T)$** | **$O(\log T)$** | **$O(1)$** | **None $O(1)$** | **Implicit (via $\phi_t$ phase)** |
 
-$$
-f_t(z) = a_t z + b_t
-$$
+---
 
-Two affine operators compose as:
+## 📐 Mathematical Foundations
 
-$$
-(a_2, b_2) \circ (a_1, b_1)
-=
-(a_2 a_1,\; a_2 b_1 + b_2)
-$$
+### 1. Complex-Valued Diagonal Dynamics
+In standard real-valued linear recurrences, scalar multipliers can only scale values (causing either exponential decay or numerical explosion). 
 
-This composition is **associative**, which means the sequential recurrence can be evaluated with a parallel prefix-scan algorithm instead of strictly from left to right.
+OSM models state transitions over the complex domain $\mathbb{C}^d$:
+$$a_t = \rho_t \odot \exp(i \phi_t)$$
 
-OSM uses a **Hillis–Steele scan** to compute all prefix compositions in parallel.
+- **Damping / Retention Rate ($\rho_t \in (0, 1)$):** Controls the memory horizon.
+- **Phase Rotation ($\phi_t \in [-\pi, \pi]$):** Encodes wave-like interference and relative positional offsets directly in frequency space.
+- **Input Injection ($b_t \in \mathbb{C}^d$):** Token embedding projected into the complex hidden manifold.
 
-Conceptually:
+Unrolling the recurrence from $t=0$ reveals how past tokens decay and rotate:
+$$z_t = \sum_{j=1}^t \left( \prod_{k=j+1}^t a_k \right) b_j = \sum_{j=1}^t \left( \prod_{k=j+1}^t \rho_k \right) \exp\left(i \sum_{k=j+1}^t \phi_k\right) b_j$$
+
+---
+
+### 2. Associative Affine Composition
+Each token emits an affine transformation $f_t(z) = a_t z + b_t$. The composition of two sequential operators $(a_1, b_1)$ followed by $(a_2, b_2)$ is:
+
+$$f_2(f_1(z)) = a_2(a_1 z + b_1) + b_2 = (a_2 a_1) z + (a_2 b_1 + b_2)$$
+
+This defines the binary associative operator $\circ$:
+$$(a_2, b_2) \circ (a_1, b_1) = \Big(a_2 \odot a_1, \; a_2 \odot b_1 + b_2\Big)$$
+
+$$\text{Associativity holds: } \big( (a_3, b_3) \circ (a_2, b_2) \big) \circ (a_1, b_1) = (a_3, b_3) \circ \big( (a_2, b_2) \circ (a_1, b_1) \big)$$
+
+---
+
+## 🔄 Parallel Prefix Scan (Hillis–Steele)
+
+Because affine composition is associative, we evaluate all prefix states in parallel across GPU threads using the **Hillis–Steele scan algorithm**:
 
 ```text
-Token operators:
-O1    O2    O3    O4    O5    O6    O7    O8
-
-Hillis–Steele scan:
-step 1: compose distance 1
-step 2: compose distance 2
-step 3: compose distance 4
-...
-
-Result:
-prefix(O1)
-prefix(O1..O2)
-prefix(O1..O3)
-...
-prefix(O1..OT)
+Sequence tokens:          [1]          [2]          [3]          [4]
+Initial operators:      (a1, b1)     (a2, b2)     (a3, b3)     (a4, b4)
+                           │            │            │            │
+Step 1 (stride 1):         │       (1)──┴──►(2)      │       (3)──┴──►(4)
+                           │         (a2a1, ...)     │         (a4a3, ...)
+                           │              │          │              │
+Step 2 (stride 2):         │              │     (1)──┴─────────────►(3)
+                           │              │            (2)──────────┴──►(4)
+                           ▼              ▼              ▼              ▼
+Final Prefixes:         z_1=b1       z_2=a2b1+b2    z_3=...        z_4=...
 ```
 
-This bridges two useful regimes:
-
-- **Training:** parallel sequence evaluation
-- **Inference:** recurrent constant-state decoding
+* **Span / Depth:** $\log_2(T)$ parallel steps (ideal for SIMD GPU execution).
+* **Total Work:** $O(T \log T)$ operator multiplications.
 
 ---
 
-## Key Features
-
-### Complex-Valued Representations
-
-OSM represents its recurrent state in the complex domain.
-
-The multiplicative operator
-
-$$
-a_t = \rho_t e^{i\phi_t}
-$$
-
-contains both:
-
-- **magnitude decay** through \(\rho_t\)
-- **phase rotation** through \(\phi_t\)
-
-This gives the recurrence a natural mechanism for representing periodic, oscillatory, and position-sensitive behavior without requiring explicit positional methods such as RoPE or ALiBi.
-
----
-
-### Learnable Forgetting
-
-The retention parameter is initialized using a positive bias:
-
-$$
-\rho = \sigma(4.5) \approx 0.989
-$$
-
-so the model begins training as a near-perfect accumulator.
-
-Instead of starting with aggressive forgetting, the network learns when information should decay.
-
-This initialization is intended to support:
-
-- long initial memory
-- stable early-training gradients
-- learned task-dependent forgetting
-
----
-
-### Sub-Quadratic Parallelism
-
-Standard dense self-attention requires pairwise token interactions and scales quadratically with sequence length:
-
-$$
-O(T^2)
-$$
-
-OSM instead evaluates the recurrence through an associative Hillis–Steele scan.
-
-The scan uses logarithmic parallel depth and \(O(T \log T)\) total scan work:
-
-$$
-O(T \log T)
-$$
-
-while preserving the underlying recurrent formulation.
-
----
-
-### Constant-State Inference
-
-During autoregressive generation, there is no need to recompute the full scan.
-
-Only the current recurrent state must be retained:
-
-$$
-z_t = a_t z_{t-1} + b_t
-$$
-
-Therefore inference requires a fixed-size recurrent state independent of sequence length:
-
-$$
-O(1)
-$$
-
-with respect to the number of previously processed tokens.
-
----
-
-### Transformer-Like Block Design
-
-OSM keeps the convenient structure of modern Transformer blocks while replacing self-attention with the operator scan.
-
-A typical block contains:
+## 🏗️ Architecture Anatomy
 
 ```text
-Input
-  │
-  ├── Pre-Norm
-  │
-  ├── Operator Scan
-  │
-  └── Residual Connection
-  │
-  ├── Pre-Norm
-  │
-  ├── GELU Feed-Forward Network
-  │
-  └── Residual Connection
-  │
-Output
+               Token Embeddings (x)
+                        │
+       ┌────────────────┴────────────────┐
+       ▼                                 ▼
+   Pre-RMSNorm                       Pre-RMSNorm
+       │                                 │
+  Linear Projections                 Linear (W_gate, W_up)
+       │                                 │
+ [ρ_t, φ_t, b_t]                         │
+       │                                 │
+ a_t = ρ_t * exp(i φ_t)                  │
+       │                                 │
+ Associative Affine Scan                 │
+       │                                 │
+ Extract Re(z_t)                         │
+       │                                 │
+  Output Projection                      │
+       │                                 │
+       ▼                                 ▼
+  Residual Add ──────────────────►  Residual Add ──► Next Layer
 ```
 
-This makes OSM compatible with familiar deep-learning design patterns while changing the sequence-mixing mechanism itself.
+### Learnable Forgetting Initialization
+To prevent early vanishing gradients and allow the model to start as a near-lossless accumulator:
+$$\rho_{\text{init}} = \sigma(4.5) \approx 0.989$$
+
+The model starts with long-term retention and selectively learns to forget context during training.
 
 ---
 
-## Complexity
+## 🚀 Minimal PyTorch Implementation
 
-| Property | OSM |
-|---|---:|
-| Training scan work | \(O(T \log T)\) |
-| Parallel scan depth | \(O(\log T)\) |
-| Autoregressive recurrent state | \(O(1)\) |
-| Pairwise attention matrix | Not required |
-| Sequence operator | Complex affine recurrence |
-
-> Complexity statements refer specifically to the scan/recurrent sequence-mixing mechanism. Overall model cost also depends on hidden dimension, projections, feed-forward layers, implementation details, and hardware efficiency.
-
----
-
-## Why Complex Operators?
-
-A real-valued scalar recurrence can primarily express attenuation or amplification.
-
-A complex-valued multiplier adds another degree of freedom:
-
-$$
-a = \rho e^{i\phi}
-$$
-
-Multiplying by \(a\) performs both:
-
-1. scaling by \(\rho\)
-2. rotation by \(\phi\)
-
-Repeated application produces:
-
-$$
-a^k = \rho^k e^{ik\phi}
-$$
-
-which naturally combines exponentially decaying memory with oscillatory structure.
-
-This makes complex affine operators attractive for sequence modeling problems involving:
-
-- long-range dependencies
-- periodic patterns
-- phase-sensitive features
-- compact recurrent memory
-
----
-
-## Minimal Recurrence
-
-A simplified sequential form looks like:
+A complete, self-contained implementation of the **Operator Scan Layer**:
 
 ```python
-z = 0
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-for x_t in sequence:
-    rho_t, phi_t, b_t = operator_projection(x_t)
+class ComplexAffineScan(torch.autograd.Function):
+    """Parallel Hillis-Steele Associative Scan over Complex Affine Pairs."""
+    @staticmethod
+    def forward(ctx, a: torch.Tensor, b: torch.Tensor):
+        # a: [B, T, D] (complex), b: [B, T, D] (complex)
+        B, T, D = a.shape
+        num_steps = (T - 1).bit_length()
+        
+        a_cum = a.clone()
+        b_cum = b.clone()
+        
+        for step in range(num_steps):
+            stride = 1 << step
+            if stride >= T:
+                break
+            
+            # Left operands: [:, :-stride]
+            # Right operands: [:, stride:]
+            a_left = a_cum[:, :-stride]
+            b_left = b_cum[:, :-stride]
+            
+            a_right = a_cum[:, stride:]
+            b_right = b_cum[:, stride:]
+            
+            # Affine composition: (a_r * a_l, a_r * b_l + b_r)
+            a_cum[:, stride:] = a_right * a_left
+            b_cum[:, stride:] = a_right * b_left + b_right
 
-    a_t = rho_t * exp(1j * phi_t)
-    z = a_t * z + b_t
+        return b_cum
 
-    y_t = output_projection(z)
+
+class OSMBlock(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+        self.norm = nn.RMSNorm(dim)
+        
+        # Projections for rho, phi (phase), and b (complex input)
+        self.proj_rho = nn.Linear(dim, dim)
+        self.proj_phi = nn.Linear(dim, dim)
+        self.proj_b_real = nn.Linear(dim, dim)
+        self.proj_b_imag = nn.Linear(dim, dim)
+        
+        self.out_proj = nn.Linear(dim, dim)
+        
+        # Initialize rho close to 1.0 (sigmoid(4.5) ~ 0.989)
+        nn.init.constant_(self.proj_rho.bias, 4.5)
+        nn.init.normal_(self.proj_rho.weight, std=0.01)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, T, D]
+        residual = x
+        x_norm = self.norm(x)
+        
+        # 1. Compute complex multiplier: a = rho * exp(i * phi)
+        rho = torch.sigmoid(self.proj_rho(x_norm))
+        phi = self.proj_phi(x_norm)
+        a = torch.polar(rho, phi)  # Creates complex tensor
+        
+        # 2. Compute complex input: b = b_real + i * b_imag
+        b = torch.complex(self.proj_b_real(x_norm), self.proj_b_imag(x_norm))
+        
+        # 3. Parallel Associative Prefix Scan
+        z = ComplexAffineScan.apply(a, b)
+        
+        # 4. Project real component back to hidden dimension
+        y = self.out_proj(z.real)
+        return residual + y
+
+    def step(self, x_t: torch.Tensor, state: torch.Tensor | None = None):
+        """O(1) Autoregressive recurrent step."""
+        # x_t: [B, 1, D], state: [B, 1, D] (complex)
+        if state is None:
+            state = torch.zeros(x_t.shape[0], 1, self.dim, dtype=torch.cfloat, device=x_t.device)
+            
+        x_norm = self.norm(x_t)
+        rho = torch.sigmoid(self.proj_rho(x_norm))
+        phi = self.proj_phi(x_norm)
+        a_t = torch.polar(rho, phi)
+        b_t = torch.complex(self.proj_b_real(x_norm), self.proj_b_imag(x_norm))
+        
+        # Constant-time recurrent update
+        new_state = a_t * state + b_t
+        y_t = self.out_proj(new_state.real)
+        return x_t + y_t, new_state
 ```
-
-During training, OSM replaces the sequential loop with an associative parallel scan.
 
 ---
 
-## Parallel Composition
-
-For affine operators:
+## 🧪 Usage Example
 
 ```python
-def compose(left, right):
-    a1, b1 = left
-    a2, b2 = right
+import torch
 
-    return (
-        a2 * a1,
-        a2 * b1 + b2,
-    )
+# Initialize model layer
+layer = OSMBlock(dim=256).cuda()
+tokens = torch.randn(2, 1024, 256, device="cuda") # [Batch=2, SeqLen=1024, Dim=256]
+
+# --- Mode 1: Parallel Training Pass ---
+output_train = layer(tokens)
+print("Training output shape:", output_train.shape)  # [2, 1024, 256]
+
+# --- Mode 2: O(1) Autoregressive Generation ---
+state = None
+generated_tokens = []
+x_t = tokens[:, :1, :]  # First token prompt
+
+for _ in range(10):
+    y_t, state = layer.step(x_t, state)
+    generated_tokens.append(y_t)
+    x_t = y_t  # Feed back for next step
+
+print("Generated steps:", len(generated_tokens))
 ```
 
-the operation satisfies associativity:
+---
 
-```text
-(O3 ∘ O2) ∘ O1 = O3 ∘ (O2 ∘ O1)
-```
+## 🔬 Theoretical Deep-Dive
 
-That property is what makes a parallel prefix scan possible.
+### Why Hillis–Steele instead of Blelloch?
+- **Hillis–Steele (Work-Inefficient Scan):** Takes $O(T \log T)$ operations and $O(\log T)$ steps. On modern GPUs with thousands of compute cores, the SIMD step-efficiency and non-branching data access often outperform work-efficient algorithms (like Blelloch) for sequences up to $T \approx 16\text{k}$.
+- **Blelloch (Work-Efficient Scan):** Takes $O(T)$ operations but requires a two-pass sweep (Up-Sweep and Down-Sweep), introducing extra memory barrier overheads.
+
+### Connection to State Space Models (SSMs) & LRUs
+OSM belongs to the family of **Diagonal Linear Recurrent Networks** (such as Linear Recurrent Units - LRU). By constraining the recurrent matrix to a diagonal complex representation, we retain the state capacity of higher-dimensional continuous SSMs while maintaining strict associative prefix parallelism.
 
 ---
 
-## Design Goals
+## 📜 Citation
 
-OSM is designed around four goals:
-
-1. **Avoid quadratic attention complexity**
-2. **Retain efficient parallel training**
-3. **Support constant-state autoregressive inference**
-4. **Provide expressive long-range dynamics through complex-valued operators**
-
----
-
-## Comparison at a Glance
-
-| Architecture | Training sequence mixing | Inference memory growth | Pairwise attention |
-|---|---:|---:|---|
-| Transformer | \(O(T^2)\) | Typically grows with KV cache | Yes |
-| Sequential RNN | \(O(T)\) work, sequential depth | \(O(1)\) state | No |
-| **OSM** | **\(O(T \log T)\) scan work, \(O(\log T)\) scan depth** | **\(O(1)\) recurrent state** | **No** |
-
----
-
-## Status
-
-OSM is an experimental sequence-modeling architecture exploring associative complex-valued affine scans as an alternative to standard attention.
-
-The project focuses on the idea that recurrent models do not necessarily need to choose between:
-
-- efficient parallel training, and
-- compact recurrent inference.
-
-Associative scans provide a way to obtain both.
-
----
-
-## Citation
-
-If you use OSM in research or experiments, please cite the repository and author.
+If you incorporate OSM into your work, please cite:
 
 ```bibtex
 @software{strehlau2026osm,
-  author = {Krzysztof Strehlau},
-  title = {OSM: Operator Scan Model},
-  year = {2026},
-  url = {https://github.com/cziter15}
+  author       = {Krzysztof Strehlau},
+  title        = {OSM: Operator Scan Model},
+  year         = {2026},
+  url          = {https://github.com/cziter15}
 }
 ```
 
 ---
 
-## License
+## 📄 License
 
-See the repository's `LICENSE` file for licensing information.
+This repository is licensed under the [MIT License](LICENSE).
+```
