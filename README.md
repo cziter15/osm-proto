@@ -278,4 +278,3 @@ If you incorporate OSM into your work, please cite:
 ## 📄 License
 
 This repository is licensed under the [MIT License](LICENSE).
-```
