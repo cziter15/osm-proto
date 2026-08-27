@@ -3,171 +3,266 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class OperatorBlock(nn.Module):
-    """Associative diagonal-complex affine scan block.
+def parallel_quantum_operator_scan(
+    a: torch.Tensor,
+    b_op: torch.Tensor,
+) -> torch.Tensor:
+    """Inclusive prefix scan for ``Z_t = a_t * Z_{t-1} + B_t``."""
+    length = a.size(1)
+    if length == 1:
+        return b_op
 
-    Each token emits z -> a*z + b, with a = rho*exp(i*phi).
-    Prefix composition is evaluated with a Hillis-Steele style scan.
-    """
-    def __init__(self, d_model: int):
+    a_cum = a
+    b_cum = b_op
+
+    for level in range((length - 1).bit_length()):
+        stride = 1 << level
+        if stride >= length:
+            break
+
+        a_left = a_cum[:, :-stride]
+        b_left = b_cum[:, :-stride]
+        a_right = a_cum[:, stride:]
+        b_right = b_cum[:, stride:]
+
+        a_combined = a_right * a_left
+        b_combined = a_right * b_left + b_right
+
+        a_cum = torch.cat([a_cum[:, :stride], a_combined], dim=1)
+        b_cum = torch.cat([b_cum[:, :stride], b_combined], dim=1)
+
+    return b_cum
+
+
+class QuantumOSMBlock(nn.Module):
+    """Current Q-OSM block: causal local convolution + complex operator scan."""
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 4,
+        d_k: int = 16,
+        d_v: int = 16,
+        d_conv: int = 4,
+    ):
         super().__init__()
-        if d_model % 2:
-            raise ValueError("d_model must be even")
-        h = d_model // 2
-        self.h = h
-        self.norm1 = nn.LayerNorm(d_model)
-        self.phase = nn.Linear(d_model, h)
-        self.retention = nn.Linear(d_model, h)
-        self.inject = nn.Linear(d_model, d_model)
-        self.proj = nn.Linear(d_model, d_model)
-        nn.init.constant_(self.retention.bias, 4.5)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.ff = nn.Sequential(
-            nn.Linear(d_model, 2 * d_model),
-            nn.GELU(),
-            nn.Linear(2 * d_model, d_model),
+        if dim <= 0 or num_heads <= 0 or d_k <= 0 or d_v <= 0 or d_conv <= 0:
+            raise ValueError("all dimensions must be positive")
+
+        self.dim = dim
+        self.num_heads = num_heads
+        self.d_k = d_k
+        self.d_v = d_v
+        self.d_conv = d_conv
+        self.d_inner = num_heads * d_v
+
+        self.norm = nn.RMSNorm(dim)
+
+        self.proj_q = nn.Linear(dim, num_heads * d_k * 2, bias=False)
+        self.proj_k = nn.Linear(dim, num_heads * d_k * 2, bias=False)
+        self.proj_v = nn.Linear(dim, num_heads * d_v * 2, bias=False)
+        self.proj_gate = nn.Linear(dim, self.d_inner, bias=False)
+
+        self.proj_phi = nn.Linear(dim, num_heads * d_k, bias=False)
+        self.decay_params = nn.Parameter(torch.empty(num_heads, 1, d_k))
+
+        self.conv1d = nn.Conv1d(
+            in_channels=dim,
+            out_channels=dim,
+            kernel_size=d_conv,
+            groups=dim,
+            padding=d_conv - 1,
+            bias=True,
+        )
+        self.out_proj = nn.Linear(self.d_inner, dim, bias=False)
+
+        with torch.no_grad():
+            self.decay_params.uniform_(-4.0, -2.0)
+
+    def _evolution(self, x: torch.Tensor) -> torch.Tensor:
+        batch, length, _ = x.shape
+        phi = self.proj_phi(x).view(
+            batch,
+            length,
+            self.num_heads,
+            1,
+            self.d_k,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        u = self.norm1(x)
-        T = x.size(1)
-        H = self.h
-        phi = self.phase(u)
-        rho = torch.sigmoid(self.retention(u))
-        ar = rho * torch.cos(phi)
-        ai = rho * torch.sin(phi)
-        z = torch.tanh(self.inject(u))
-        br, bi = z[..., :H], z[..., H:]
+        # Keep every head strictly inside the unit disk. This is the stable
+        # evolution used by the current architecture for long scans.
+        rho = torch.exp(-F.softplus(self.decay_params.float()))
+        rho = rho.unsqueeze(0).unsqueeze(0).expand_as(phi)
+        return torch.polar(rho, phi.float())
 
-        offset = 1
-        while offset < T:
-            A, I, R, J = ar, ai, br, bi
-            a2r, a2i = A[:, offset:], I[:, offset:]
-            a1r, a1i = A[:, :-offset], I[:, :-offset]
-            b2r, b2i = R[:, offset:], J[:, offset:]
-            b1r, b1i = R[:, :-offset], J[:, :-offset]
-            ar = torch.cat([A[:, :offset], a2r*a1r - a2i*a1i], dim=1)
-            ai = torch.cat([I[:, :offset], a2r*a1i + a2i*a1r], dim=1)
-            br = torch.cat([R[:, :offset], a2r*b1r - a2i*b1i + b2r], dim=1)
-            bi = torch.cat([J[:, :offset], a2r*b1i + a2i*b1r + b2i], dim=1)
-            offset *= 2
+    def _project(self, x: torch.Tensor):
+        batch, length, _ = x.shape
 
-        state = torch.cat([br, bi], dim=-1)
-        x = x + self.proj(state)
-        return x + self.ff(self.norm2(x))
+        def complex_projection(layer: nn.Linear, width: int) -> torch.Tensor:
+            raw = layer(x).view(
+                batch,
+                length,
+                self.num_heads,
+                width,
+                2,
+            )
+            return torch.complex(raw[..., 0].float(), raw[..., 1].float())
 
-
-class OSM(nn.Module):
-    def __init__(self, vocab_size: int, d_model: int = 64, n_layers: int = 4):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, d_model)
-        self.blocks = nn.ModuleList([OperatorBlock(d_model) for _ in range(n_layers)])
-        self.norm = nn.LayerNorm(d_model)
-        self.lm_head = nn.Linear(d_model, vocab_size)
-
-    def forward(self, idx: torch.Tensor) -> torch.Tensor:
-        h = self.embedding(idx)
-        for block in self.blocks:
-            h = block(h)
-        return self.lm_head(self.norm(h))
-
-
-class ImprovedOSMBlock(nn.Module):
-    """Gated local-conv complex scan block.
-
-    The convolution is explicitly left-padded (causal), and the scan uses
-    functional prefix composition instead of in-place writes so bf16/autograd
-    remain safe.  This is intentionally a separate block so old checkpoints
-    retain the original OSM architecture.
-    """
-    def __init__(self, dim: int, d_conv: int = 4, expand: int = 2):
-        super().__init__()
-        self.d_inner = dim * expand
-        self.norm = nn.RMSNorm(dim)
-        self.in_proj = nn.Linear(dim, self.d_inner * 2, bias=False)
-        self.conv1d = nn.Conv1d(self.d_inner, self.d_inner, d_conv,
-                                groups=self.d_inner, padding=0)
-        self.nu_param = nn.Parameter(torch.empty(self.d_inner))
-        self.proj_phi = nn.Linear(self.d_inner, self.d_inner, bias=False)
-        self.proj_b_real = nn.Linear(self.d_inner, self.d_inner, bias=False)
-        self.proj_b_imag = nn.Linear(self.d_inner, self.d_inner, bias=False)
-        self.out_proj = nn.Linear(self.d_inner, dim, bias=False)
-        nn.init.uniform_(self.nu_param, -3.0, 0.0)
+        q = complex_projection(self.proj_q, self.d_k)
+        k = F.normalize(complex_projection(self.proj_k, self.d_k), p=2, dim=-1)
+        v = complex_projection(self.proj_v, self.d_v)
+        return q, k, v
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
-        branch, gate = self.in_proj(self.norm(x)).chunk(2, dim=-1)
-        conv_in = F.pad(branch.transpose(1, 2), (self.conv1d.kernel_size[0] - 1, 0))
-        conv = F.silu(self.conv1d(conv_in).transpose(1, 2))
-        # torch.polar has no bf16 kernel on current CUDA builds; keep the
-        # small complex recurrence in fp32 and let the surrounding block use
-        # autocast for the linear/convolution work.
-        rho = torch.exp(-F.softplus(self.nu_param.float()))
-        phi = self.proj_phi(conv).float()
-        a = torch.polar(rho.expand_as(phi), phi)
-        b = torch.complex(self.proj_b_real(conv).float(), self.proj_b_imag(conv).float())
-        z = self._chunked_scan(a, b) if a.size(1) > 2048 else self._parallel_scan(a, b)
-        return residual + self.out_proj(z.real * F.silu(gate))
+        x_norm = self.norm(x)
+        length = x.size(1)
 
-    @staticmethod
-    def _parallel_scan(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        _, result = ImprovedOSMBlock._parallel_scan_pair(a, b)
-        return result
+        conv = self.conv1d(x_norm.transpose(1, 2))[:, :, :length].transpose(1, 2)
+        conv = F.silu(conv)
 
-    @staticmethod
-    def _parallel_scan_pair(a: torch.Tensor, b: torch.Tensor):
-        length = a.size(1)
-        levels = (length - 1).bit_length()
-        aa, bb = a, b
-        for level in range(levels):
-            stride = 1 << level
-            if stride >= length:
-                break
-            a_prev = torch.cat([torch.ones_like(aa[:, :stride]), aa[:, :-stride]], dim=1)
-            b_prev = torch.cat([torch.zeros_like(bb[:, :stride]), bb[:, :-stride]], dim=1)
-            # Compose (a_current, b_current) after (a_previous, b_previous).
-            # Preserve a_current: using the updated cumulative A here is an
-            # incorrect affine composition and destabilizes long scans.
-            a_current, b_current = aa, bb
-            aa = a_current * a_prev
-            bb = a_current * b_prev + b_current
-        return aa, bb
+        q, k, v = self._project(conv)
+        b_op = v.unsqueeze(-1) * torch.conj(k.unsqueeze(-2))
+        z = parallel_quantum_operator_scan(self._evolution(conv), b_op)
 
-    @staticmethod
-    def _chunked_scan(a: torch.Tensor, b: torch.Tensor, chunk_size: int = 1024) -> torch.Tensor:
-        """Scan long sequences in bounded chunks while carrying state forward.
+        out = (z * q.unsqueeze(-2)).sum(dim=-1).real
+        out = out.reshape(x.size(0), length, self.d_inner)
+        gate = F.silu(self.proj_gate(x_norm))
+        return residual + self.out_proj(out * gate)
 
-        The associative pair (A, B) for each chunk is composed with the
-        previous chunk's final state. This keeps the scan workspace bounded by
-        ``chunk_size`` and supports million-token inference without a million
-        token prefix tensor.
-        """
-        carry = torch.zeros_like(b[:, :1])
-        outputs = []
-        for start in range(0, a.size(1), chunk_size):
-            aa, bb = ImprovedOSMBlock._parallel_scan_pair(
-                a[:, start:start + chunk_size], b[:, start:start + chunk_size])
-            chunk = bb + aa * carry
-            outputs.append(chunk)
-            carry = chunk[:, -1:]
-        return torch.cat(outputs, dim=1)
+    def step(
+        self,
+        x_t: torch.Tensor,
+        conv_state: torch.Tensor | None = None,
+        z_state: torch.Tensor | None = None,
+    ):
+        """Process one token using constant-size recurrent state."""
+        batch, length, dim = x_t.shape
+        if length != 1:
+            raise ValueError("step() expects shape [batch, 1, dim]")
+
+        x_norm = self.norm(x_t)
+        flat = x_norm[:, 0]
+
+        if conv_state is None:
+            conv_state = torch.zeros(
+                batch,
+                dim,
+                self.d_conv - 1,
+                device=x_t.device,
+                dtype=x_t.dtype,
+            )
+
+        conv_buffer = torch.cat([conv_state, flat.unsqueeze(-1)], dim=-1)
+        new_conv_state = conv_buffer[:, :, 1:]
+
+        weight = self.conv1d.weight[:, 0, :]
+        conv = (conv_buffer * weight.unsqueeze(0)).sum(dim=-1)
+        if self.conv1d.bias is not None:
+            conv = conv + self.conv1d.bias
+        conv = F.silu(conv).unsqueeze(1)
+
+        q, k, v = self._project(conv)
+        b_op = v.unsqueeze(-1) * torch.conj(k.unsqueeze(-2))
+        a = self._evolution(conv)
+
+        if z_state is None:
+            z_state = torch.zeros(
+                batch,
+                1,
+                self.num_heads,
+                self.d_v,
+                self.d_k,
+                device=x_t.device,
+                dtype=torch.cfloat,
+            )
+
+        new_z_state = a * z_state + b_op
+        out = (new_z_state * q.unsqueeze(-2)).sum(dim=-1).real
+        out = out.reshape(batch, 1, self.d_inner)
+        gate = F.silu(self.proj_gate(x_norm))
+        y_t = x_t + self.out_proj(out * gate)
+
+        return y_t, new_conv_state, new_z_state
 
 
-class ImprovedOSM(nn.Module):
-    """OSM language model using ImprovedOSMBlock."""
-    def __init__(self, vocab_size: int, d_model: int = 256, n_layers: int = 8,
-                 d_conv: int = 4, expand: int = 2):
+class QuantumOSMForCausalLM(nn.Module):
+    """Current Q-OSM causal language model."""
+
+    def __init__(
+        self,
+        vocab_size: int,
+        dim: int = 128,
+        depth: int = 4,
+        num_heads: int = 4,
+        d_k: int = 16,
+        d_v: int = 16,
+        d_conv: int = 4,
+    ):
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size, d_model)
-        self.blocks = nn.ModuleList([
-            ImprovedOSMBlock(d_model, d_conv=d_conv, expand=expand)
-            for _ in range(n_layers)
-        ])
-        self.norm = nn.RMSNorm(d_model)
-        self.lm_head = nn.Linear(d_model, vocab_size)
+        if vocab_size <= 0:
+            raise ValueError("vocab_size must be positive")
 
-    def forward(self, idx: torch.Tensor) -> torch.Tensor:
-        h = self.embedding(idx)
-        for block in self.blocks:
-            h = block(h)
-        return self.lm_head(self.norm(h))
+        self.dim = dim
+        self.embedding = nn.Embedding(vocab_size, dim)
+        nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
+
+        self.layers = nn.ModuleList(
+            [
+                QuantumOSMBlock(
+                    dim=dim,
+                    num_heads=num_heads,
+                    d_k=d_k,
+                    d_v=d_v,
+                    d_conv=d_conv,
+                )
+                for _ in range(depth)
+            ]
+        )
+
+        self.final_norm = nn.RMSNorm(dim)
+        self.lm_head = nn.Linear(dim, vocab_size, bias=False)
+        self.lm_head.weight = self.embedding.weight
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        x = self.embedding(input_ids)
+        for layer in self.layers:
+            x = layer(x)
+        return self.lm_head(self.final_norm(x))
+
+    @torch.no_grad()
+    def generate(self, input_ids: torch.Tensor, max_new_tokens: int = 10) -> torch.Tensor:
+        if input_ids.ndim != 2 or input_ids.size(1) == 0:
+            raise ValueError("input_ids must have shape [batch, sequence] with sequence > 0")
+        if max_new_tokens < 0:
+            raise ValueError("max_new_tokens must be non-negative")
+
+        conv_states = [None] * len(self.layers)
+        z_states = [None] * len(self.layers)
+        x_t = None
+
+        for t in range(input_ids.size(1)):
+            x_t = self.embedding(input_ids[:, t:t + 1])
+            for i, layer in enumerate(self.layers):
+                x_t, conv_states[i], z_states[i] = layer.step(
+                    x_t,
+                    conv_states[i],
+                    z_states[i],
+                )
+
+        output_ids = input_ids.clone()
+
+        for _ in range(max_new_tokens):
+            logits = self.lm_head(self.final_norm(x_t))[:, -1]
+            next_token = logits.argmax(dim=-1, keepdim=True)
+            output_ids = torch.cat([output_ids, next_token], dim=-1)
+
+            x_t = self.embedding(next_token)
+            for i, layer in enumerate(self.layers):
+                x_t, conv_states[i], z_states[i] = layer.step(
+                    x_t,
+                    conv_states[i],
+                    z_states[i],
+                )
+
+        return output_ids
